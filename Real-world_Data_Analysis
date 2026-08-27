@@ -1,1 +1,451 @@
+# =============================================================================
+# Epigenome-Wide Gene-Gene Interaction Analysis for PTSD-Depression Comorbidity
+#
+# This script identifies DNA methylation CpG sites and their pairwise interactions
+# associated with comorbid PTSD, using:
+#   - Distance correlation (DCOR) screening
+#   - Mutual information (MI) with permutation testing for interactions
+#   - High-dimensional inference via de-sparsified Lasso (HDI / lasso.proj)
+#
+# Author:  Yuzhao Gao <gyz@sxufe.edu.cn>
+# Date:    2026-08-27
+#
+# Required packages: infotheo, discretization, energy, hdi, pcaMethods, dplyr
+# =============================================================================
+
+# ---- 0. Package loading -----------------------------------------------------
+
+required_packages <- c("infotheo", "discretization", "energy", "hdi",
+                       "pcaMethods", "dplyr")
+
+load_packages <- function(packages) {
+  missing_pkgs <- packages[!sapply(packages, requireNamespace, quietly = TRUE)]
+  if (length(missing_pkgs) > 0) {
+    message("Installing missing packages: ", paste(missing_pkgs, collapse = ", "))
+    install.packages(missing_pkgs)
+  }
+  invisible(lapply(packages, library, character.only = TRUE))
+}
+
+load_packages(required_packages)
+
+# ---- 1. Helper functions ----------------------------------------------------
+
+#' Remove missing values and standardize a matrix/data.frame.
+#' @param mat A numeric matrix or data.frame.
+#' @return A centered and scaled matrix.
+standardize <- function(mat) {
+  mat <- as.matrix(mat)
+  scale(mat, center = TRUE, scale = TRUE)
+}
+
+#' Regress out covariates and return residuals.
+#' Used to orthogonalize methylation sites / features with respect to
+#' confounding variables (principal components, cell-type proportions, etc.).
+#' @param x         Response vector.
+#' @param covariate Matrix or data.frame of covariates to regress out.
+#' @param na.action How to handle missing values (default: na.exclude).
+#' @return Residual vector (same length as x when na.exclude is used).
+get_residuals <- function(x, covariate = NULL, na.action = na.exclude) {
+  if (is.null(covariate)) {
+    return(x - mean(x, na.rm = TRUE))
+  }
+  covariate <- as.data.frame(covariate)
+  df <- cbind(response = x, covariate)
+  model <- lm(response ~ ., data = df, na.action = na.action)
+  residuals(model)
+}
+
+#' Distance correlation test with permutation-based p-value.
+#' Wrapper around energy::dcor.test.
+#' @param x   First variable/matrix.
+#' @param y   Second variable/matrix.
+#' @param R   Number of permutations.
+#' @return List with dCor and p_value.
+dcor_perm_test <- function(x, y, R = 999) {
+  res <- energy::dcor.test(x, y, R = R)
+  list(dCor = res$statistic, p_value = res$p.value)
+}
+
+# ---- 2. Data preparation ----------------------------------------------------
+
+#' Prepare analysis-ready data from raw inputs.
+#' @param dat      Phenotype / clinical data (rows = subjects).
+#' @param expr     Methylation beta matrix (probes in rows, subjects in columns).
+#' @param gpl1     Probe-to-gene annotation (columns: Name, gene_name).
+#' @param config   List of configuration parameters (see default_config).
+#' @return List containing meth, y, x, life_stress, cell covariates, etc.
+prepare_data <- function(dat, expr, gpl1, config = default_config()) {
+  with(config, {
+    # Life stress variables (column positions)
+    life <- dat[, life_cols, drop = FALSE]
+    complete_idx <- complete.cases(life)
+    dat1 <- dat[complete_idx, ]
+
+    # Keep only subjects with known PTSD treatment status
+    cov <- dat1[!is.na(dat1[[treat_var]]), ]
+    cov_no <- cov[cov[[treat_var]] == "No", ]
+
+    # Define binary PTSD_Dep outcome based on BDI and PSS thresholds
+    cov_no$PTSD_Dep <- NA
+    cov_no$PTSD_Dep[cov_no$BDI >= bdi_high & cov_no$PSS >= pss_high] <- 1
+    cov_no$PTSD_Dep[cov_no$BDI <= bdi_low  & cov_no$PSS <= pss_low]  <- 0
+
+    # Drop missing outcome / BMI / sexual abuse
+    cov_no <- cov_no[complete.cases(cov_no[, c("PTSD_Dep", bmi_var, abuse_var)]), ]
+    cov_clean <- cov_no[cov_no$race == race_val, ]
+
+    # Align methylation data (columns = subjects) with phenotype rows
+    common <- intersect(colnames(expr), rownames(cov_clean))
+    meth <- expr[, common, drop = FALSE]
+    cov_clean <- cov_clean[common, ]
+
+    # Encode sexual abuse as binary (1 = yes, 0 = no)
+    x <- as.numeric(cov_clean[[abuse_var]])
+    x[x == 1] <- 0
+    x[x == 2] <- 1
+
+    list(
+      cov        = cov_clean,
+      meth       = meth,
+      y          = cov_clean$PTSD_Dep,
+      x          = x,
+      life_stress = cov_clean[, life_cols, drop = FALSE],
+      cell       = cov_clean[, cell_cols, drop = FALSE]
+    )
+  })
+}
+
+#' Default configuration parameters for prepare_data.
+default_config <- function() {
+  list(
+    treat_var = "treat.PTSD",
+    bmi_var   = "bmi",
+    abuse_var = "sexual.abuse",
+    race_val  = 1,
+    bdi_high  = 14,
+    bdi_low   = 7,
+    pss_high  = 14,
+    pss_low   = 7,
+    life_cols = 15:18,
+    cell_cols = c("CD8T", "CD4T", "NK", "Bcell", "Mono")
+  )
+}
+
+# ---- 3. M-value transformation and gene grouping -----------------------------
+
+#' Group methylation probes by gene and compute M-values.
+#' M-value = log2(beta / (1 - beta)).
+#' @param meth  Methylation beta matrix (probes x subjects).
+#' @param gpl1  Probe-to-gene mapping (Name, gene_name).
+#' @return Named list: one matrix (sites x samples) per gene.
+group_by_gene <- function(meth, gpl1) {
+  common <- intersect(rownames(meth), gpl1$Name)
+  idx <- match(common, gpl1$Name)
+  gene_names <- as.character(gpl1$gene_name[idx])
+  unique_genes <- unique(gene_names)
+
+  result <- lapply(unique_genes, function(g) {
+    probes <- common[gene_names == g]
+    mat <- t(meth[probes, , drop = FALSE])   # sites x samples
+    log(mat / (1 - mat))                      # M-value transformation
+  })
+  names(result) <- unique_genes
+  result
+}
+
+# ---- 4. Gene screening via distance correlation ------------------------------
+
+#' Screen genes by distance correlation with exposure x.
+#' For each gene, the maximum DCOR statistic across its CpG sites is used.
+#' Selects the top d = ceiling(n / (2 log n)) genes.
+#' @param meth_list List of gene matrices (from group_by_gene).
+#' @param x         Exposure vector.
+#' @param R         Permutations for dcor.test.
+#' @return Indices and names of selected genes.
+screen_genes <- function(meth_list, x, R = 199) {
+  n <- length(x)
+  d <- ceiling(n / (2 * log(n)))
+
+  stats <- sapply(meth_list, function(mat) {
+    # Maximum DCOR statistic across CpG sites within the gene
+    site_stats <- apply(mat, 2, function(col) {
+      energy::dcor.test(col, x, R = R)$statistic
+    })
+    max(site_stats)
+  })
+
+  sorted <- sort(stats, decreasing = TRUE)
+  threshold <- sorted[min(d, length(sorted))]
+  selected <- which(stats >= threshold)
+
+  list(selected = selected, selected_genes = names(meth_list)[selected],
+       stats = stats)
+}
+
+# ---- 5. Discretization (using infotheo) --------------------------------------
+
+#' Discretize a continuous matrix using equal-frequency binning.
+#' Wrapper around infotheo::discretize.
+#' @param mat   Numeric matrix (samples x features).
+#' @param nbins Number of bins (default floor(sqrt(n))).
+#' @return Integer matrix of discretized values.
+discretize_matrix <- function(mat, nbins = NULL) {
+  mat <- as.matrix(mat)
+  if (is.null(nbins)) nbins <- floor(sqrt(nrow(mat)))
+  disc <- infotheo::discretize(mat, disc = "equalfreq", nbins = nbins)
+  storage.mode(disc) <- "integer"
+  disc
+}
+
+# ---- 6. Mutual-information-based interaction detection ------------------------
+
+#' Compute pairwise mutual information with permutation testing.
+#' @param M_disc    Discretized matrix (samples x CpG sites).
+#' @param gene_cols List: for each gene, the column indices it occupies in M_disc.
+#' @param n_perm    Number of permutations.
+#' @return Named list of numeric vectors (obs_mi, p_value).
+compute_interactions <- function(M_disc, gene_cols, n_perm = 200) {
+  pairs <- combn(seq_along(gene_cols), 2, simplify = FALSE)
+  results <- list()
+
+  for (pair in pairs) {
+    g1 <- gene_cols[[pair[1]]]
+    g2 <- gene_cols[[pair[2]]]
+    combos <- expand.grid(g1, g2, stringsAsFactors = FALSE)
+
+    # Observed mutual information
+    obs_mi <- apply(combos, 1, function(row) {
+      infotheo::mutinformation(M_disc[, row[1]], M_disc[, row[2]], method = "shrink")
+    })
+
+    # Permutation: shuffle rows of the second gene's columns
+    perm_mi <- replicate(n_perm, {
+      perm_idx <- sample(nrow(M_disc))
+      perm_data <- M_disc
+      perm_data[, g2] <- M_disc[perm_idx, g2, drop = FALSE]
+      apply(combos, 1, function(row) {
+        infotheo::mutinformation(perm_data[, row[1]], perm_data[, row[2]], method = "shrink")
+      })
+    })
+
+    pvals <- (rowSums(perm_mi >= obs_mi) + 1) / (n_perm + 1)
+
+    for (i in seq_len(nrow(combos))) {
+      key <- paste0("CpG", combos[i, 1], "_CpG", combos[i, 2])
+      results[[key]] <- c(obs_mi = obs_mi[i], p_value = pvals[i])
+    }
+  }
+  results
+}
+
+# ---- 7. Build interaction-term matrix ----------------------------------------
+
+#' Construct interaction (product) terms from significant CpG pairs.
+#' @param M_norm    Normalized continuous matrix (samples x CpG sites).
+#' @param mi_res    Output of compute_interactions.
+#' @param alpha     Significance threshold for p-value.
+#' @param mi_quant  Quantile threshold for MI (e.g. 0.95).
+#' @return Matrix of standardized interaction terms (samples x pairs).
+build_interactions <- function(M_norm, mi_res, alpha = 0.1, mi_quant = 0.95) {
+  mi_df <- do.call(rbind, mi_res)
+  sig <- which(mi_df[, "p_value"] < alpha &
+                mi_df[, "obs_mi"] > quantile(mi_df[, "obs_mi"], mi_quant, na.rm = TRUE))
+
+  if (length(sig) == 0) {
+    message("No significant interaction pairs found.")
+    return(matrix(0, nrow = nrow(M_norm), ncol = 1,
+                  dimnames = list(NULL, "No_Significant_Pairs")))
+  }
+
+  keys <- names(mi_res)[sig]
+  out <- sapply(keys, function(key) {
+    cols <- as.numeric(strsplit(gsub("CpG", "", key), "_")[[1]])
+    scale(M_norm[, cols[1]] * M_norm[, cols[2]])[, 1]
+  })
+  colnames(out) <- keys
+  out
+}
+
+# ---- 8. High-dimensional inference (HDI / lasso.proj) ------------------------
+
+#' Run de-sparsified Lasso (lasso.proj) for main and interaction effects.
+#' @param X_main      Main-effect design matrix (including exposure x).
+#' @param X_int       Interaction-term matrix.
+#' @param y           Binary outcome.
+#' @param covariates  Matrix of adjustment variables (PC + cell types).
+#' @param seed        Random seed for reproducibility.
+#' @return List of p-values (p_main, p_int).
+run_hdi <- function(X_main, X_int, y, covariates, seed = 120021) {
+  df_main <- cbind(X_main, covariates)
+  df_int  <- cbind(X_int, covariates)
+  n_cov   <- ncol(covariates)
+
+  fit_main <- tryCatch({
+    set.seed(seed)
+    hdi::lasso.proj(df_main, y, family = "binomial")
+  }, error = function(e) {
+    warning("lasso.proj (main) failed: ", e$message)
+    NULL
+  })
+
+  fit_int <- tryCatch({
+    set.seed(seed + 1)
+    hdi::lasso.proj(df_int, y, family = "binomial")
+  }, error = function(e) {
+    warning("lasso.proj (interaction) failed: ", e$message)
+    NULL
+  })
+
+  # Drop intercept + covariate p-values, keep only features of interest
+  trim <- function(fit, n_feat) {
+    if (is.null(fit)) return(rep(NA, n_feat))
+    p <- fit$pval
+    p[seq_len(n_feat)]
+  }
+
+  list(
+    p_main = trim(fit_main, ncol(X_main)),
+    p_int  = trim(fit_int,  ncol(X_int))
+  )
+}
+
+# ---- 9. Main pipeline --------------------------------------------------------
+
+#' Full analysis pipeline.
+#' @param dat        Phenotype data.
+#' @param expr       Methylation beta matrix.
+#' @param gpl1       Probe-gene annotation.
+#' @param n_perm     Permutations for MI permutation test.
+#' @param output_dir Directory to save results.
+#' @return Invisible list of key results (also written to output_dir).
+run_analysis <- function(dat, expr, gpl1,
+                         n_perm = 200,
+                         output_dir = "./results") {
+  # Step 1: Data preparation
+  prep <- prepare_data(dat, expr, gpl1)
+  n <- length(prep$y)
+  message("Sample size: ", n)
+
+  # Step 2: Group probes by gene + M-value transform
+  meth_list <- group_by_gene(prep$meth, gpl1)
+  message("Total genes: ", length(meth_list))
+
+  # Step 3: Screen genes by distance correlation
+  screen <- screen_genes(meth_list, prep$x, R = 199)
+  aim <- meth_list[screen$selected]
+  message("Genes after screening: ", length(aim))
+
+  # Step 4: Normalize and discretize
+  M_norm <- do.call(cbind, aim)
+  M_norm <- standardize(M_norm)
+  M_disc <- discretize_matrix(M_norm)
+
+  # Gene -> column-index mapping
+  gene_cols <- list()
+  start <- 1
+  for (i in seq_along(aim)) {
+    nc <- ncol(aim[[i]])
+    gene_cols[[i]] <- start:(start + nc - 1)
+    start <- start + nc
+  }
+
+  # Step 5: Mutual-information interaction detection
+  mi_res <- compute_interactions(M_disc, gene_cols, n_perm = n_perm)
+  message("CpG-CpG pairs tested: ", length(mi_res))
+
+  int_mat <- build_interactions(M_norm, mi_res)
+
+  # Step 6: Covariates (PC of life stress + cell types)
+  pc <- pcaMethods::pca(prep$life_stress, method = "svd", scale = "uv", nPcs = 1)
+  pc_scores <- pcaMethods::scores(pc)[, 1]
+  covariates <- cbind(pc = pc_scores, prep$cell)
+
+  # Step 7: HDI inference
+  hdi_res <- run_hdi(
+    X_main = cbind(x = prep$x, M_norm),
+    X_int  = int_mat,
+    y      = prep$y,
+    covariates = covariates
+  )
+
+  # Step 8: Assemble and save results
+  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Main effects
+  main_p <- data.frame(
+    variable = c("x", colnames(M_norm)),
+    p_value  = hdi_res$p_main,
+    stringsAsFactors = FALSE
+  )
+  main_sig <- main_p[main_p$p_value < 0.05, ]
+  write.csv(main_sig, file.path(output_dir, "significant_main_effects.csv"),
+            row.names = FALSE)
+
+  # Interactions
+  if (ncol(int_mat) == 1 && colnames(int_mat)[1] == "No_Significant_Pairs") {
+    write.csv(data.frame(interaction = "None", p_value = NA),
+              file.path(output_dir, "significant_interactions.csv"),
+              row.names = FALSE)
+  } else {
+    int_p <- data.frame(
+      interaction = colnames(int_mat),
+      p_value     = hdi_res$p_int,
+      stringsAsFactors = FALSE
+    )
+    int_sig <- int_p[int_p$p_value < 0.05, ]
+    write.csv(int_sig, file.path(output_dir, "significant_interactions.csv"),
+              row.names = FALSE)
+  }
+
+  message("Done. Results written to ", normalizePath(output_dir))
+  invisible(list(prep = prep, screen = screen, mi = mi_res, hdi = hdi_res))
+}
+
+# ---- 10. Example / demo (simulated data) ------------------------------------
+# Set `run_demo` to TRUE (or the environment variable EPI_RUN_DEMO=1)
+# to execute with simulated data. This block is intended for testing and
+# will NOT run when the script is sourced during a normal analysis.
+run_demo <- (toupper(Sys.getenv("EPI_RUN_DEMO", "FALSE")) %in% c("1", "TRUE"))
+
+if (run_demo) {
+  set.seed(123)
+  n <- 80
+  p_probes <- 60
+  n_genes <- 6
+
+  # Methylation beta matrix (probes x samples)
+  expr_demo <- matrix(rbeta(p_probes * n, 2, 8), nrow = p_probes, ncol = n)
+  rownames(expr_demo) <- paste0("cg", seq_len(p_probes))
+  colnames(expr_demo) <- paste0("sample", seq_len(n))
+
+  # Phenotype data
+  dat_demo <- data.frame(
+    BDI = sample(0:30, n, replace = TRUE),
+    PSS = sample(0:30, n, replace = TRUE),
+    treat.PTSD = sample(c("Yes", "No"), n, replace = TRUE, prob = c(0.3, 0.7)),
+    bmi = round(rnorm(n, 25, 4), 1),
+    sexual.abuse = sample(1:2, n, replace = TRUE),
+    race = rep(1, n),
+    CD8T = runif(n, 0, 0.2),
+    CD4T = runif(n, 0, 0.3),
+    NK   = runif(n, 0, 0.1),
+    Bcell = runif(n, 0, 0.1),
+    Mono  = runif(n, 0, 0.1),
+    matrix(rnorm(n * 4), n, 4)   # life stress variables (cols 15:18)
+  )
+  rownames(dat_demo) <- paste0("sample", seq_len(n))
+
+  # Probe-gene annotation
+  gpl1_demo <- data.frame(
+    Name      = paste0("cg", seq_len(p_probes)),
+    gene_name = paste0("Gene", rep(seq_len(n_genes), each = p_probes / n_genes)),
+    stringsAsFactors = FALSE
+  )
+
+  run_analysis(dat_demo, expr_demo, gpl1_demo,
+               n_perm = 50, output_dir = "./demo_results")
+}
+
+# ---- End of script ----------------------------------------------------------
 
