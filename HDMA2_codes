@@ -1,1 +1,321 @@
+# =============================================================================
+# HDMA2: High-Dimensional Mediation Analysis (Gene-Gene Interaction, Model 2)
+#        ---- Analysis function only (NO data simulation) ----
+#
+# Input: Real data (exposure X, outcome Y, multiple gene expression/methylation matrices M_list)
+# Output: Locus-level main effect p-values, interaction term p-values (joint significance)
+#
+# Path definitions:
+#   Path a  : X -> M_g1, M_g2   (distance correlation + HDI)
+#   Path b  : Z -> Y | X        (HDI on interaction term)
+#   Joint   : pmax(p_dcor, p_HDI)
+#
+# Dependencies: infotheo, energy, hdi, MASS
+# Author: Yuzhao Gao <gyz@sxufe.edu.cn>
+# =============================================================================
 
+# ---- Load dependencies ------------------------------------------------------
+required_pkgs <- c("infotheo", "energy", "hdi", "MASS")
+for (p in required_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop(sprintf("Package '%s' is required but not installed.", p))
+  }
+}
+library(infotheo)   # mutinformation, discretize
+library(energy)     # dcor.test
+library(hdi)        # lasso.proj
+
+# =============================================================================
+# Section 1. Utility functions
+# =============================================================================
+
+#' Default configuration: central management of all thresholds and parameters
+#' @return list
+default_config <- function() {
+  list(
+    nbins       = NULL,   # NULL => floor(sqrt(n))
+    n_perm_mi   = 500,    # number of permutations for mutual information
+    n_perm_dcor = 500,    # number of permutations for distance correlation
+    mi_alpha    = 0.05,   # significance level for interaction screening
+    mi_qtile    = 0.9,    # keep MI values above this quantile
+    final_alpha = 0.05,   # final joint significance threshold
+    mcores      = 1       # number of cores for parallel computing (1 = sequential)
+  )
+}
+
+#' Compute column index ranges for each gene in the combined matrix
+#' @param M_list list, each element is a gene matrix (samples x loci)
+#' @return list, each element is a vector of column indices for that gene
+gene_col_ranges <- function(M_list) {
+  cs <- cumsum(c(1, sapply(M_list, ncol)))
+  lapply(seq_along(M_list), function(i) cs[i]:(cs[i + 1] - 1))
+}
+
+#' Regress out covariates from a vector y and return residuals
+#' @param y response vector
+#' @param covariates covariate matrix/data frame (can be NULL)
+#' @return residual vector, same length as y
+residualize <- function(y, covariates = NULL) {
+  if (is.null(covariates) || ncol(as.matrix(covariates)) == 0L) {
+    return(y - mean(y, na.rm = TRUE))
+  }
+  df <- cbind.data.frame(response = y, as.data.frame(covariates))
+  residuals(lm(response ~ ., data = df, na.action = na.exclude))
+}
+
+#' Standardize + equal-frequency discretization
+#' @param M continuous matrix (samples x loci)
+#' @param nbins number of bins; NULL => floor(sqrt(n))
+#' @return discretized integer matrix
+discretize_mediator <- function(M, nbins = NULL) {
+  M_scaled <- scale(M)
+  if (is.null(nbins)) nbins <- floor(sqrt(nrow(M)))
+  d <- infotheo::discretize(M_scaled, disc = "equalfreq", nbins = nbins)
+  apply(as.matrix(d), 2, function(x) as.integer(as.numeric(x)))
+}
+
+#' Distance correlation + permutation p-value (energy package)
+dcor_pvalue <- function(x, y, R = 499) {
+  res <- energy::dcor.test(x, y, R = R)
+  list(dCor = as.numeric(res$statistic), p = as.numeric(res$p.value))
+}
+
+# =============================================================================
+# Section 2. Gene-gene interaction screening (mutual information + permutation)
+# =============================================================================
+
+#' Detect significant gene-pair interactions based on discretized mutual information
+#' @param M_disc   discretized matrix (samples x loci)
+#' @param gene_cols list, each element is a vector of column indices for one gene
+#' @param n_perm   number of permutations
+#' @param alpha    significance level
+#' @param mi_qtile keep MI values above this quantile
+#' @param mcores   number of cores for parallel computing (1 = sequential)
+#' @param M_orig   original continuous matrix, used to construct interaction terms
+#' @return list(significant_pairs, interaction_matrix)
+detect_interactions <- function(M_disc, gene_cols, n_perm = 500,
+                                alpha = 0.05, mi_qtile = 0.9,
+                                mcores = 1, M_orig = NULL) {
+  n <- nrow(M_disc)
+  ng <- length(gene_cols)
+  pairs <- combn(ng, 2, simplify = FALSE)
+
+  if (is.null(M_orig)) {
+    stop("M_orig (continuous mediator matrix) must be provided to construct interaction terms.")
+  }
+
+  # Computation for a single gene pair
+  compute_pair <- function(pair) {
+    g1 <- gene_cols[[pair[1]]]
+    g2 <- gene_cols[[pair[2]]]
+    combos <- expand.grid(g1, g2, stringsAsFactors = FALSE)
+
+    obs_mi <- apply(combos, 1, function(row) {
+      infotheo::mutinformation(M_disc[, row[1]], M_disc[, row[2]], method = "emp")
+    })
+
+    # Permutation: only shuffle rows of g2 columns
+    perm_matrix <- replicate(n_perm, {
+      idx <- sample(seq_len(n))
+      perm_d <- M_disc
+      perm_d[, g2] <- M_disc[idx, g2]
+      apply(combos, 1, function(row) {
+        infotheo::mutinformation(perm_d[, row[1]], perm_d[, row[2]], method = "emp")
+      })
+    })
+    if (n_perm > 1 && is.matrix(perm_matrix)) perm_matrix <- t(perm_matrix)
+
+    p_vals <- sapply(seq_len(nrow(combos)), function(i) {
+      (sum(perm_matrix[, i] >= obs_mi[i]) + 1) / (n_perm + 1)
+    })
+
+    keys <- paste0("G", combos[, 1], "_G", combos[, 2])
+    setNames(as.list(cbind(obs_mi = obs_mi, p_value = p_vals)), keys)
+  }
+
+  # Sequential or parallel execution
+  if (mcores > 1) {
+    cl <- makeCluster(mcores)
+    on.exit(stopCluster(cl), add = TRUE)
+    pair_res <- parLapply(cl, pairs, compute_pair)
+  } else {
+    pair_res <- lapply(pairs, compute_pair)
+  }
+
+  mi_results <- do.call(c, pair_res)
+
+  # Filter significant pairs
+  mi_vals <- sapply(mi_results, function(x) x["obs_mi"])
+  p_vals  <- sapply(mi_results, function(x) x["p_value"])
+  keep <- which(p_vals < alpha & mi_vals > quantile(mi_vals, mi_qtile, na.rm = TRUE))
+
+  if (length(keep) == 0) {
+    return(list(
+      significant_pairs  = character(0),
+      interaction_matrix = matrix(0, nrow = n, ncol = 1,
+                                  dimnames = list(NULL, "No_Significant_Pairs"))
+    ))
+  }
+
+  sig_pairs <- names(mi_results)[keep]
+
+  # Construct interaction terms using original continuous matrix (pmax, consistent with original PP1)
+  int_mat <- sapply(sig_pairs, function(pair) {
+    cols <- as.numeric(strsplit(gsub("G", "", pair), "_")[[1]])
+    pmax(M_orig[, cols[1]], M_orig[, cols[2]])
+  })
+  colnames(int_mat) <- sig_pairs
+
+  list(significant_pairs = sig_pairs, interaction_matrix = as.matrix(int_mat))
+}
+
+# =============================================================================
+# Section 3. High-dimensional inference (HDI, de-sparsified Lasso)
+# =============================================================================
+
+#' Run HDI on both main-effects model and interaction model, returning p-values
+#' @param X_main main-effects design matrix (X + loci)
+#' @param X_int  interaction-effects design matrix (X + interaction terms)
+#' @param Y      binary outcome
+#' @param seed   random seed
+#' @return list(p_main, p_int)
+run_hdi <- function(X_main, X_int, Y, seed = 42) {
+  set.seed(seed)
+  fit_main <- hdi::lasso.proj(X_main, Y, family = "binomial")
+  p_main <- fit_main$pval[-1]   # drop intercept
+
+  set.seed(seed + 1)
+  fit_int <- hdi::lasso.proj(X_int, Y, family = "binomial")
+  p_int <- fit_int$pval[-1]
+
+  list(p_main = p_main, p_int = p_int)
+}
+
+# =============================================================================
+# Section 4. Main function: HDMA2 fitting
+# =============================================================================
+
+#' HDMA2 main function: obtain joint significance p-values from real data
+#'
+#' @param X       exposure vector (length n)
+#' @param Y       binary outcome vector (length n)
+#' @param M_list  list, each element is a gene matrix (n x loci); at least 2
+#' @param covariates covariate matrix/data frame (optional, will be regressed out from X and each locus)
+#' @param config  output of default_config()
+#' @param interaction interaction construction method: "pmax" (default) or "product"
+#'
+#' @return list:
+#'   $joint_main        : locus-level joint p-values (path a)
+#'   $joint_int         : interaction-term joint p-values (path b)
+#'   $significant_pairs : names of significant interaction pairs
+#'   $hdi               : raw HDI output
+#'   $first_steps       : distance correlation details
+#'
+#' @export
+hdma2 <- function(X, Y, M_list, covariates = NULL,
+                  config = default_config(),
+                  interaction = c("pmax", "product")) {
+  interaction <- match.arg(interaction)
+
+  # ---- Basic checks ----
+  if (!is.list(M_list) || length(M_list) < 2) {
+    stop("M_list must be a list with at least 2 gene matrices.")
+  }
+  n <- length(X)
+  if (length(Y) != n) stop("Length of Y does not match length of X.")
+  for (i in seq_along(M_list)) {
+    if (nrow(M_list[[i]]) != n) {
+      stop(sprintf("Number of rows in M_list[[%d]] (%d) does not match sample size (%d).",
+                   i, nrow(M_list[[i]]), n))
+    }
+  }
+
+  # ---- Combine locus matrices ----
+  M_all <- do.call(cbind, M_list)
+  locus_names <- unlist(lapply(seq_along(M_list), function(i) {
+    paste0("G", i, "_L", seq_len(ncol(M_list[[i]])))
+  }))
+  colnames(M_all) <- locus_names
+
+  # ---- Optional residualization (control for covariates) ----
+  if (!is.null(covariates)) {
+    X <- residualize(X, covariates)
+    for (j in seq_len(ncol(M_all))) {
+      M_all[, j] <- residualize(M_all[, j], covariates)
+    }
+  }
+
+  # ---- Standardize + discretize ----
+  M_norm <- scale(M_all)
+  colnames(M_norm) <- locus_names
+  M_disc <- discretize_mediator(M_all, nbins = config$nbins)
+
+  # ---- Column ranges for each gene ----
+  gene_cols <- gene_col_ranges(M_list)
+
+  # ---- Step 1: Interaction screening ----
+  int_res <- detect_interactions(
+    M_disc      = M_disc,
+    gene_cols   = gene_cols,
+    n_perm      = config$n_perm_mi,
+    alpha       = config$mi_alpha,
+    mi_qtile    = config$mi_qtile,
+    mcores      = config$mcores,
+    M_orig      = M_all
+  )
+  Z <- int_res$interaction_matrix   # n x (n_pairs or 1 placeholder column)
+
+  # ---- Step 2: HDI (main effects + interaction effects) ----
+  X_main <- data.frame(X = X, M_norm)
+  X_int  <- data.frame(X = X, Z = Z)
+  hdi_res <- run_hdi(X_main, X_int, Y)
+
+  # ---- Step 3: Distance correlation p-values (energy::dcor.test) ----
+  ff <- ncol(X_main)
+  first_steps <- matrix(0, nrow = 2, ncol = ff - 1)
+  rownames(first_steps) <- c("dCor", "p_value")
+  for (f1 in 2:ff) {
+    res <- dcor_pvalue(X_main[, f1], X, R = config$n_perm_dcor)
+    first_steps[1, f1 - 1] <- res$dCor
+    first_steps[2, f1 - 1] <- res$p
+  }
+  colnames(first_steps) <- colnames(X_main)[-1]
+
+  # ---- Step 4: Joint significance = pmax(p_dcor, p_HDI) ----
+  # Main effects: element-wise maximum of dcor p-value and HDI p-value
+  p_hdi_main <- hdi_res$p_main[seq_along(locus_names)]
+  joint_main <- pmax(first_steps["p_value", ], p_hdi_main, na.rm = FALSE)
+  names(joint_main) <- locus_names
+
+  # Interaction terms: HDI p-values
+  p_hdi_int <- hdi_res$p_int[seq_along(colnames(Z))]
+  names(p_hdi_int) <- colnames(Z)
+  joint_int <- p_hdi_int
+
+  # ---- Return ----
+  list(
+    joint_main        = joint_main,         # locus-level joint p-values (path a)
+    joint_int         = joint_int,          # interaction-term joint p-values (path b)
+    significant_pairs = int_res$significant_pairs,
+    first_steps       = first_steps,        # distance correlation details
+    hdi               = hdi_res             # raw HDI output
+  )
+}
+
+# =============================================================================
+# Section 5. Multi-replicate summarization (for simulation studies)
+# =============================================================================
+
+#' Summarize detection rate for a specific interaction pair over multiple replicates
+#' @param results_list list of hdma2() outputs from multiple runs
+#' @param target_pair  target interaction pair name pattern, e.g. "G1_G2" (will match columns containing this pattern)
+#' @param alpha        significance level
+#' @return detection rate (proportion of simulations where target is declared significant)
+summarize_power <- function(results_list, target_pair = "G1_G2", alpha = 0.05) {
+  n_sim <- length(results_list)
+  detected <- sapply(results_list, function(r) {
+    any(grepl(target_pair, names(r$joint_int))) &&
+      any(r$joint_int[grepl(target_pair, names(r$joint_int))] < alpha)
+  })
+  mean(detected)
+}
